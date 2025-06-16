@@ -1,0 +1,311 @@
+//// File: crates/v1/src/config/mod.rs
+use crate::error::{AppError, AppResult};
+use config::{Config, Environment, File};
+use dotenvy::dotenv;
+use serde::Deserialize;
+use tracing::warn;
+
+#[derive(Debug, Deserialize)]
+pub struct AppConfig {
+    pub app: App,
+    pub postgres: Postgres,
+    pub logging: Logging,
+}
+
+/// [app] section
+#[derive(Debug, Deserialize)]
+pub struct App {
+    pub host: String,
+    pub version: String,
+    pub port: u16,
+}
+
+/// [postgres] section
+#[derive(Debug, Deserialize)]
+pub struct Postgres {
+    pub host: String,
+    pub port: u16,
+    pub name: String,
+    pub user: String,
+    pub password: String,
+    pub max_connections: u32,
+}
+
+/// [logging] section
+#[derive(Debug, Deserialize)]
+pub struct Logging {
+    /// Logging level. Allowed values: "error", "warn", "info", "debug", "trace"
+    pub level: String,
+    /// Logging format. Allowed values: "json", "plain"
+    pub format: String,
+}
+
+impl AppConfig {
+    /// Read defaults.toml → development.toml → environment variables in this order
+    pub fn new() -> AppResult<Self> {
+        // Read environment variables, but don't error if .env is missing
+        if let Err(e) = dotenv() {
+            warn!(".env file not found or failed to load: {}", e);
+        }
+
+        let builder = Config::builder()
+            // default.toml
+            .add_source(File::with_name("defaults").required(true))
+            // development.toml
+            .add_source(File::with_name("development").required(false))
+            // .env
+            .add_source(Environment::with_prefix("APP").separator("__"))
+            .add_source(Environment::with_prefix("POSTGRES").separator("__"))
+            .add_source(Environment::with_prefix("LOGGING").separator("__"));
+
+        builder
+            .build()
+            .map_err(|e| {
+                AppError::InternalServerError(Some(format!(
+                    "Failed to build configuration from files and environment: {}",
+                    e
+                )))
+            })?
+            .try_deserialize()
+            .map_err(|e| {
+                AppError::InternalServerError(Some(format!(
+                    "Failed to deserialize configuration into AppConfig struct: {}",
+                    e
+                )))
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+
+    /// 環境変数やファイルから読み込んだ AppConfig を Debug で表示するだけのテスト
+    #[test]
+    fn print_app_config() {
+        // optional: 環境変数でオーバーライドしたい場合はここで set_var できます
+        // env::set_var("APP__HOST", "test-host");
+
+        // 設定読み込み
+        let cfg = AppConfig::new().expect("Failed to load AppConfig");
+
+        // Debug 表現で出力（pretty print）
+        println!("{:#?}", cfg);
+
+        // 値自体の検証も可能：ここでは単に port が 0 でないことをチェック
+        assert!(cfg.app.port > 0, "app.port should be > 0");
+    }
+}
+
+
+//// File: crates/v1/src/error.rs
+//! Centralized application errors and conversions.
+use crate::presentation::common_dto::ApiError;
+use AppError::*;
+use argon2::password_hash::Error as Argon2Error;
+use axum::{
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+use chrono::Utc;
+use sqlx::Error as SqlxError;
+use thiserror::Error;
+use tracing::*;
+
+/// Convenient alias used across the project.
+pub type AppResult<T> = Result<T, AppError>;
+
+/// Top-level application error.
+/// Each variant maps to an HTTP status code and optional detail.
+#[derive(Debug, Error)]
+pub enum AppError {
+    #[error("Bad Request")]
+    BadRequest(Option<String>),
+    #[error("Unauthorized")]
+    Unauthorized(Option<String>),
+    #[error("Forbidden")]
+    Forbidden(Option<String>),
+    #[error("Not Found")]
+    NotFound(Option<String>),
+    #[error("Request Timeout")]
+    RequestTimeout(Option<String>),
+    #[error("Conflict")]
+    Conflict(Option<String>),
+    #[error("I'm a Teapot")]
+    ImATeapot(Option<String>),
+    /// validation error
+    #[error("Unprocessable Content")]
+    UnprocessableContent(Option<String>),
+    #[error("Internal Server Error")]
+    InternalServerError(Option<String>),
+}
+
+impl AppError {
+    /// Converted to HTTP status code
+    pub fn status_code(&self) -> StatusCode {
+        use AppError::*;
+        match self {
+            BadRequest(_) => StatusCode::BAD_REQUEST,
+            Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Forbidden(_) => StatusCode::FORBIDDEN,
+            NotFound(_) => StatusCode::NOT_FOUND,
+            RequestTimeout(_) => StatusCode::REQUEST_TIMEOUT,
+            Conflict(_) => StatusCode::CONFLICT,
+            ImATeapot(_) => StatusCode::IM_A_TEAPOT,
+            UnprocessableContent(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            InternalServerError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+    /// optional detail
+    pub fn detail(&self) -> Option<&String> {
+        match self {
+            BadRequest(d)
+            | Unauthorized(d)
+            | Forbidden(d)
+            | NotFound(d)
+            | RequestTimeout(d)
+            | Conflict(d)
+            | ImATeapot(d)
+            | UnprocessableContent(d)
+            | InternalServerError(d) => d.as_ref(),
+        }
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let status = self.status_code();
+
+        // Always log errors for consistency
+        if status.is_server_error() {
+            error!(?self, "internal server error");
+        } else {
+            warn!(?self, "client error");
+        }
+
+        // 5xx does not return detail
+        let body = if status.is_server_error() {
+            ApiError {
+                status: status.as_u16(),
+                message: status
+                    .canonical_reason()
+                    .unwrap_or("Internal Server Error")
+                    .to_string(),
+                detail: None,
+                instance: None,
+                timestamp: Utc::now().timestamp(),
+            }
+        } else {
+            ApiError {
+                status: status.as_u16(),
+                message: status.canonical_reason().unwrap_or("Error").to_string(),
+                detail: self.detail().cloned(),
+                instance: None,
+                timestamp: Utc::now().timestamp(),
+            }
+        };
+
+        (status, Json(body)).into_response()
+    }
+}
+
+// Conversions
+impl From<SqlxError> for AppError {
+    fn from(e: SqlxError) -> Self {
+        match e {
+            SqlxError::RowNotFound => AppError::NotFound(Some("Resource not found".to_string())),
+            other => AppError::InternalServerError(Some(format!("DB error: {other}"))),
+        }
+    }
+}
+
+/// Password hashing / verification errors.
+#[derive(Debug, Error)]
+pub enum HashingError {
+    #[error("Password mismatch")]
+    PasswordMismatch,
+    #[error("Argon2 error: {0}")]
+    Argon2(#[from] Argon2Error),
+}
+
+/// Database errors used in domain layer.
+#[derive(Debug, Error)]
+pub enum DatabaseError {
+    #[error("Row not found")]
+    NotFound,
+    #[error(transparent)]
+    Sqlx(#[from] SqlxError),
+}
+
+
+//// File: crates/v1/src/lib.rs
+pub mod config;
+pub mod error;
+pub mod presentation;
+
+
+//// File: crates/v1/src/main.rs
+#[tokio::main]
+async fn main() {
+    println!("Hello, world!");
+}
+
+
+//// File: crates/v1/src/presentation/common_dto.rs
+/// Defines the standard format for API responses.
+use serde::Serialize;
+
+/// Successful response structure.
+#[derive(Debug, Serialize)]
+pub struct ApiResponse<T> {
+    /// The actual response data.
+    pub data: T,
+    /// A message describing the result or providing additional context.
+    pub message: String,
+    /// The time the response was generated (UNIX timestamp).
+    pub timestamp: i64,
+}
+
+/// Error response structure.
+#[derive(Debug, Serialize)]
+pub struct ApiError {
+    /// HTTP status code corresponding to the error.
+    pub status: u16,
+    /// A short, human-readable summary of the error.
+    pub message: String,
+    /// An optional detailed explanation of the error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// An optional URI or identifier of the instance where the error occurred.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    /// The time the error response was generated (UNIX timestamp).
+    pub timestamp: i64,
+}
+
+
+//// File: crates/v1/src/presentation/mod.rs
+pub mod common_dto;
+pub mod response_helper;
+
+
+//// File: crates/v1/src/presentation/response_helper.rs
+//! Helpers for successful API responses.
+
+use crate::presentation::common_dto::ApiResponse;
+use axum::{Json, http::StatusCode, response::IntoResponse};
+use chrono::Utc;
+use serde::Serialize;
+
+/// Wraps any serializable payload into a unified success envelope.
+pub fn api_ok<T: Serialize>(data: T) -> impl IntoResponse {
+    let body = ApiResponse {
+        data,
+        message: "success".into(),
+        timestamp: Utc::now().timestamp(),
+    };
+    (StatusCode::OK, Json(body))
+}
+
+
