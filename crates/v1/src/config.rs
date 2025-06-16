@@ -56,8 +56,13 @@ impl AppConfig {
             .join("config");
 
         let builder = Config::builder()
-            .add_source(File::from(root_config.join("defaults.toml")).required(true))
-            .add_source(File::from(root_config.join("development.toml")).required(false))
+            .add_source(
+                File::from(root_config.join("defaults.toml")).required(true),
+            )
+            .add_source(
+                File::from(root_config.join("development.toml"))
+                    .required(false),
+            )
             .add_source(Environment::with_prefix("APP").separator("__"))
             .add_source(Environment::with_prefix("POSTGRES").separator("__"))
             .add_source(Environment::with_prefix("LOGGING").separator("__"));
@@ -77,6 +82,18 @@ impl AppConfig {
                     e
                 )))
             })
+    }
+
+    /// postgres接続用URLを組立てて返す。
+    pub fn get_postgres_url(&self) -> String {
+        format!(
+            "postgres://{}:{}@{}:{}/{}",
+            self.postgres.user,
+            self.postgres.password,
+            self.postgres.host,
+            self.postgres.port,
+            self.postgres.name
+        )
     }
 }
 
