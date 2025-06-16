@@ -1,0 +1,9 @@
+[package]
+name = "v1"
+version = "0.1.0"
+edition = "2024"
+
+# = { workspace = true }
+[dependencies]
+tokio = { workspace = true }
+sqlx = { workspace = true }

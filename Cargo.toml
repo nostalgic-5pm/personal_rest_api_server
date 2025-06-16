@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = ["crates/v1"]
+
+[workspace.dependencies]
+sqlx = { version = "0.8.6", features = ["runtime-tokio", "tls-native-tls", "postgres"] }
+tokio = { version = "1.45.1", features = ["full"] }
