@@ -1,6 +1,6 @@
 //! アプリケーション全体で使用するエラー型及び変換ロジックを集約するモジュール。
 
-use crate::presentation::common_dto::ApiError;
+use crate::presentation::dto::common_dto::ApiError;
 use AppError::*;
 use argon2::password_hash::Error as Argon2Error;
 use axum::{

@@ -36,6 +36,8 @@ This project is also meant to be a learning experience, and I believe using Rust
 ## Consequences
 I'll need to learn Rust's ownership model and async patterns, but this should also help me write safer and more efficient code overall.
 
+## Reference
+
 ## Notes
 Owner: nostalgic.5pm
 Proposed date: 2025-06-01

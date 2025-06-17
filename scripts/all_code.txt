@@ -1,9 +1,12 @@
-//// File: crates/v1/src/config/mod.rs
+//// File: crates/v1/src/config.rs
 use crate::error::{AppError, AppResult};
 use config::{Config, Environment, File};
 use dotenvy::dotenv;
 use serde::Deserialize;
-use tracing::warn;
+use std::path::PathBuf;
+use tracing::{info, warn};
+use tracing_subscriber::filter::LevelFilter;
+use urlencoding::encode;
 
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
@@ -40,20 +43,44 @@ pub struct Logging {
     pub format: String,
 }
 
+impl Logging {
+    /// LevelをtracingのLevelに変換して返す。
+    pub fn level_filter(&self) -> LevelFilter {
+        match self.level.to_lowercase().as_str() {
+            "error" => LevelFilter::ERROR,
+            "warn" => LevelFilter::WARN,
+            "info" => LevelFilter::INFO,
+            "debug" => LevelFilter::DEBUG,
+            "trace" => LevelFilter::TRACE,
+            // 設定値が上記に存在しない場合は，infoを返す。
+            other => {
+                warn!("Unknown log level '{}', defaulting to INFO", other);
+                LevelFilter::INFO
+            }
+        }
+    }
+
+    /// ログのフォーマットがJSONか，それ以外(PRETTY)か判定する。
+    /// JSONの場合は，Trueを返す。
+    pub fn is_json(&self) -> bool {
+        matches!(self.format.to_lowercase().as_str(), "json" | "structured")
+    }
+}
+
 impl AppConfig {
     /// Read defaults.toml → development.toml → environment variables in this order
     pub fn new() -> AppResult<Self> {
         // Read environment variables, but don't error if .env is missing
-        if let Err(e) = dotenv() {
-            warn!(".env file not found or failed to load: {}", e);
+        if dotenv().is_err() {
+            warn!(".env file not found or failed to load");
         }
 
+        let config_dir = Self::workspace_root()?;
+        info!("Loading configuration from {:?}", config_dir);
+
         let builder = Config::builder()
-            // default.toml
-            .add_source(File::with_name("defaults").required(true))
-            // development.toml
-            .add_source(File::with_name("development").required(false))
-            // .env
+            .add_source(File::from(config_dir.join("defaults.toml")).required(true))
+            .add_source(File::from(config_dir.join("development.toml")).required(false))
             .add_source(Environment::with_prefix("APP").separator("__"))
             .add_source(Environment::with_prefix("POSTGRES").separator("__"))
             .add_source(Environment::with_prefix("LOGGING").separator("__"));
@@ -74,32 +101,67 @@ impl AppConfig {
                 )))
             })
     }
+
+    /// postgres接続用URLを組立てて返す。
+    pub fn get_postgres_url(&self) -> String {
+        format!(
+            "postgres://{}:{}@{}:{}/{}",
+            self.postgres.user,
+            encode(&self.postgres.password), // passwordはエンコードする。
+            self.postgres.host,
+            self.postgres.port,
+            self.postgres.name
+        )
+    }
+
+    pub fn get_masked_postgres_url(&self) -> String {
+        let masked_user = self.postgres.user.chars().next().unwrap_or('_');
+        let masked_pass = "**".to_string();
+        let masked_host = self.postgres.host.chars().next().unwrap_or('_');
+        let masked_port = self.postgres.port.to_string().chars().next().unwrap_or('_'); //一桁目のみ
+        let masked_name = self.postgres.name.chars().next().unwrap_or('_');
+        format!(
+            "postgres://{}*:{}@{}*:{}*/{}*",
+            masked_user, masked_pass, masked_host, masked_port, masked_name
+        )
+    }
+
+    fn workspace_root() -> AppResult<PathBuf> {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest_dir
+            .parent() // crates
+            .and_then(|p| p.parent()) // workspace root
+            .ok_or_else(|| {
+                AppError::InternalServerError(Some(
+                    "Failed to locate workspace root from CARGO_MANIFEST_DIR".into(),
+                ))
+            })?;
+        let config_dir = root.join("config");
+        if !config_dir.is_dir() {
+            return Err(AppError::InternalServerError(Some(format!(
+                "Expected config directory at {:?}, but not found",
+                config_dir
+            ))));
+        }
+        Ok(config_dir)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::AppConfig;
-
-    /// 環境変数やファイルから読み込んだ AppConfig を Debug で表示するだけのテスト
+    /// AppConfig が正常に読み込めるか確認し、内容を表示
     #[test]
     fn print_app_config() {
-        // optional: 環境変数でオーバーライドしたい場合はここで set_var できます
-        // env::set_var("APP__HOST", "test-host");
-
-        // 設定読み込み
         let cfg = AppConfig::new().expect("Failed to load AppConfig");
-
-        // Debug 表現で出力（pretty print）
         println!("{:#?}", cfg);
-
-        // 値自体の検証も可能：ここでは単に port が 0 でないことをチェック
-        assert!(cfg.app.port > 0, "app.port should be > 0");
     }
 }
 
 
 //// File: crates/v1/src/error.rs
-//! Centralized application errors and conversions.
+//! アプリケーション全体で使用するエラー型及び変換ロジックを集約するモジュール。
+
 use crate::presentation::common_dto::ApiError;
 use AppError::*;
 use argon2::password_hash::Error as Argon2Error;
@@ -113,11 +175,19 @@ use sqlx::Error as SqlxError;
 use thiserror::Error;
 use tracing::*;
 
-/// Convenient alias used across the project.
+/// プロジェクト全体で使用するResult型。
 pub type AppResult<T> = Result<T, AppError>;
 
-/// Top-level application error.
-/// Each variant maps to an HTTP status code and optional detail.
+/// PostgreSQLのSQLSTATEコード定数。
+pub mod sqlx_error_code {
+    pub const UNIQUE_VIOLATION: &str = "23505";
+    pub const FK_VIOLATION: &str = "23503";
+    pub const NOT_NULL_VIOLATION: &str = "23502";
+    pub const CHECK_VIOLATION: &str = "23514";
+}
+
+/// アプリケーション全体で使用される上位エラー型。
+/// 各バリアントは対応する<HTTP Status Code>とOpt.の<Detail>を持つ。
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("Bad Request")]
@@ -142,7 +212,7 @@ pub enum AppError {
 }
 
 impl AppError {
-    /// Converted to HTTP status code
+    /// AppErrorを<HTTP Status Code>に変換する。
     pub fn status_code(&self) -> StatusCode {
         use AppError::*;
         match self {
@@ -157,7 +227,7 @@ impl AppError {
             InternalServerError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
-    /// optional detail
+    /// AppErrorが持つ<Detail>を返す（無ければ None）。
     pub fn detail(&self) -> Option<&String> {
         match self {
             BadRequest(d)
@@ -174,17 +244,18 @@ impl AppError {
 }
 
 impl IntoResponse for AppError {
+    /// AppErrorをaxumの<HTTP Response>に変換する。
     fn into_response(self) -> Response {
         let status = self.status_code();
 
-        // Always log errors for consistency
+        // ログ出力（500系はerror、それ以外はwarn）
         if status.is_server_error() {
             error!(?self, "internal server error");
         } else {
             warn!(?self, "client error");
         }
 
-        // 5xx does not return detail
+        // Statusに応じてResponse Bodyを構築（500系には<Detail>を含めない）
         let body = if status.is_server_error() {
             ApiError {
                 status: status.as_u16(),
@@ -210,17 +281,45 @@ impl IntoResponse for AppError {
     }
 }
 
-// Conversions
+/// sqlx のエラーをAppErrorに変換する。
 impl From<SqlxError> for AppError {
     fn from(e: SqlxError) -> Self {
+        // エラーを文字列化する。
+        let e_str = e.to_string();
+
         match e {
-            SqlxError::RowNotFound => AppError::NotFound(Some("Resource not found".to_string())),
+            SqlxError::RowNotFound => AppError::NotFound(Some("Resource not found".into())),
+            SqlxError::PoolTimedOut => AppError::RequestTimeout(Some("Database timeout".into())),
+            SqlxError::Database(db_err) => match db_err.code().unwrap_or_default().as_ref() {
+                sqlx_error_code::UNIQUE_VIOLATION => {
+                    AppError::Conflict(Some("Duplicate key".into()))
+                }
+                sqlx_error_code::FK_VIOLATION => {
+                    AppError::Conflict(Some("Foreign-key violation".into()))
+                }
+                sqlx_error_code::NOT_NULL_VIOLATION => {
+                    AppError::BadRequest(Some("Null value in column".into()))
+                }
+                sqlx_error_code::CHECK_VIOLATION => {
+                    AppError::UnprocessableContent(Some("Check violation".into()))
+                }
+                code => AppError::InternalServerError(Some(format!(
+                    "Database error ({code}): {}",
+                    db_err.message()
+                ))),
+            },
+            // 文字列に"timeout"が含まれていれば408エラー。
+            _ if e_str.contains("timeout") => {
+                AppError::RequestTimeout(Some("Database timeout".into()))
+            }
+
+            // その他不明なエラー。
             other => AppError::InternalServerError(Some(format!("DB error: {other}"))),
         }
     }
 }
 
-/// Password hashing / verification errors.
+/// パスワードのハッシュ化・検証に関連するエラー。
 #[derive(Debug, Error)]
 pub enum HashingError {
     #[error("Password mismatch")]
@@ -229,7 +328,7 @@ pub enum HashingError {
     Argon2(#[from] Argon2Error),
 }
 
-/// Database errors used in domain layer.
+/// ドメイン層で使用されるデータベース関連のエラー。
 #[derive(Debug, Error)]
 pub enum DatabaseError {
     #[error("Row not found")]
@@ -246,9 +345,112 @@ pub mod presentation;
 
 
 //// File: crates/v1/src/main.rs
+use axum::{Router, extract::Extension, routing::get};
+use sqlx::postgres::PgPoolOptions;
+use std::net::{IpAddr, SocketAddr};
+use tokio::{net::TcpListener, signal};
+use tracing::info;
+use tracing_subscriber::{
+    fmt::{self, time::UtcTime},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
+use v1::{
+    config::{AppConfig, Logging},
+    error::{AppError, AppResult},
+};
+
 #[tokio::main]
-async fn main() {
-    println!("Hello, world!");
+async fn main() -> AppResult<()> {
+    // Configを読み込む
+    let config = AppConfig::new()?;
+    // Tracingの初期化
+    init_tracing(&config.logging);
+    info!("Configuration loaded: version {}", config.app.version);
+
+    // postgres接続
+    let postgres_url = config.get_postgres_url();
+    let postgres_pool = PgPoolOptions::new()
+        .connect(&postgres_url)
+        .await
+        .map_err(|e| {
+            AppError::InternalServerError(Some(format!("Failed to connect with postgres: {}", e)))
+        })?;
+    info!(
+        "Connected to the postgres: {}",
+        config.get_masked_postgres_url()
+    );
+
+    let app = Router::new()
+        .route("/", get(root))
+        .layer(Extension(postgres_pool));
+
+    // Construct a socket address by combining host and port
+    let ip: IpAddr =
+        config.app.host.parse().map_err(|e| {
+            AppError::InternalServerError(format!("Invalid IP address: {}", e).into())
+        })?;
+    let address = SocketAddr::new(ip, config.app.port);
+
+    let listener = TcpListener::bind(&address)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("Failed to bind: {}", e).into()))?;
+    info!("▶ Server running on http://{}", &address);
+
+    // Start the Axum server with graceful shutdown
+    axum::serve(listener, app.into_make_service())
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .map_err(|e| {
+            AppError::InternalServerError(format!("Failed to start application: {}", e).into())
+        })?;
+
+    Ok(())
+}
+
+async fn root() -> &'static str {
+    "Hello, world!"
+}
+
+async fn shutdown_signal() {
+    signal::ctrl_c()
+        .await
+        .expect("Failed to install Ctrl+C handler.");
+    info!("Shutting down the server...")
+}
+
+fn init_tracing(config: &Logging) {
+    // filter = Configで設定されているLoggingのレベル。
+    let filter = config.level_filter();
+
+    // ログのフォーマットを定義する。
+    let fmt_layer = fmt::layer()
+        .with_timer(UtcTime::rfc_3339())
+        .with_level(true)
+        .with_target(false)
+        //.with_thread_ids(true)
+        //.with_thread_names(true)
+        ;
+
+    // Json or Prettyでフォーマットする。
+    if config.is_json() {
+        tracing_subscriber::registry()
+            .with(fmt_layer.json())
+            .with(filter)
+            .init()
+    } else {
+        tracing_subscriber::registry()
+            .with(fmt_layer.pretty())
+            .with(filter)
+            .init()
+    }
+}
+
+#[test]
+fn debug() {
+    let config = AppConfig::new().expect("Failed to create AppConfig");
+    let postgres_url = config.get_postgres_url();
+    println!("{}", postgres_url);
 }
 
 

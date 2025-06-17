@@ -12,7 +12,7 @@ password = "password"
 max_connections = 10
 
 [logging]
-# "json" or "pretty"
+# "error", "warn", "info", "debug", "trace"
 level = "info"
 # "json" or "pretty"
 format = "pretty"
