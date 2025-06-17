@@ -4,6 +4,8 @@ use dotenvy::dotenv;
 use serde::Deserialize;
 use std::path::PathBuf;
 use tracing::{info, warn};
+use tracing_subscriber::filter::LevelFilter;
+use urlencoding::encode;
 
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
@@ -38,6 +40,30 @@ pub struct Logging {
     pub level: String,
     /// Logging format. Allowed values: "json", "plain"
     pub format: String,
+}
+
+impl Logging {
+    /// LevelをtracingのLevelに変換して返す。
+    pub fn level_filter(&self) -> LevelFilter {
+        match self.level.to_lowercase().as_str() {
+            "error" => LevelFilter::ERROR,
+            "warn" => LevelFilter::WARN,
+            "info" => LevelFilter::INFO,
+            "debug" => LevelFilter::DEBUG,
+            "trace" => LevelFilter::TRACE,
+            // 設定値が上記に存在しない場合は，infoを返す。
+            other => {
+                warn!("Unknown log level '{}', defaulting to INFO", other);
+                LevelFilter::INFO
+            }
+        }
+    }
+
+    /// ログのフォーマットがJSONか，それ以外(PRETTY)か判定する。
+    /// JSONの場合は，Trueを返す。
+    pub fn is_json(&self) -> bool {
+        matches!(self.format.to_lowercase().as_str(), "json" | "structured")
+    }
 }
 
 impl AppConfig {
@@ -80,10 +106,22 @@ impl AppConfig {
         format!(
             "postgres://{}:{}@{}:{}/{}",
             self.postgres.user,
-            self.postgres.password,
+            encode(&self.postgres.password), // passwordはエンコードする。
             self.postgres.host,
             self.postgres.port,
             self.postgres.name
+        )
+    }
+
+    pub fn get_masked_postgres_url(&self) -> String {
+        let masked_user = self.postgres.user.chars().next().unwrap_or('_');
+        let masked_pass = "**".to_string();
+        let masked_host = self.postgres.host.chars().next().unwrap_or('_');
+        let masked_port = self.postgres.port.to_string().chars().next().unwrap_or('_'); //一桁目のみ
+        let masked_name = self.postgres.name.chars().next().unwrap_or('_');
+        format!(
+            "postgres://{}*:{}@{}*:{}*/{}*",
+            masked_user, masked_pass, masked_host, masked_port, masked_name
         )
     }
 

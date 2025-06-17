@@ -2,19 +2,26 @@ use axum::{Router, extract::Extension, routing::get};
 use sqlx::postgres::PgPoolOptions;
 use std::net::{IpAddr, SocketAddr};
 use tokio::{net::TcpListener, signal};
-use tracing::{Level, info};
-use tracing_subscriber;
+use tracing::info;
+use tracing_subscriber::{
+    fmt::{self, time::UtcTime},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
 use v1::{
-    config::AppConfig,
+    config::{AppConfig, Logging},
     error::{AppError, AppResult},
 };
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
-    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
-
-    // Configの読み込み
+    // Configを読み込む
     let config = AppConfig::new()?;
+    // Tracingの初期化
+    init_tracing(&config.logging);
+    info!("Configuration loaded: version {}", config.app.version);
+
+    // postgres接続
     let postgres_url = config.get_postgres_url();
     let postgres_pool = PgPoolOptions::new()
         .connect(&postgres_url)
@@ -22,7 +29,10 @@ async fn main() -> AppResult<()> {
         .map_err(|e| {
             AppError::InternalServerError(Some(format!("Failed to connect with postgres: {}", e)))
         })?;
-    info!("Connected to the postgres!");
+    info!(
+        "Connected to the postgres: {}",
+        config.get_masked_postgres_url()
+    );
 
     let app = Router::new()
         .route("/", get(root))
@@ -60,6 +70,33 @@ async fn shutdown_signal() {
         .await
         .expect("Failed to install Ctrl+C handler.");
     info!("Shutting down the server...")
+}
+
+fn init_tracing(config: &Logging) {
+    // filter = Configで設定されているLoggingのレベル。
+    let filter = config.level_filter();
+
+    // ログのフォーマットを定義する。
+    let fmt_layer = fmt::layer()
+        .with_timer(UtcTime::rfc_3339())
+        .with_level(true)
+        .with_target(false)
+        //.with_thread_ids(true)
+        //.with_thread_names(true)
+        ;
+
+    // Json or Prettyでフォーマットする。
+    if config.is_json() {
+        tracing_subscriber::registry()
+            .with(fmt_layer.json())
+            .with(filter)
+            .init()
+    } else {
+        tracing_subscriber::registry()
+            .with(fmt_layer.pretty())
+            .with(filter)
+            .init()
+    }
 }
 
 #[test]

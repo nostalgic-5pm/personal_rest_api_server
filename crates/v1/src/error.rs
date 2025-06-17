@@ -1,4 +1,5 @@
-//! Centralized application errors and conversions.
+//! アプリケーション全体で使用するエラー型及び変換ロジックを集約するモジュール。
+
 use crate::presentation::common_dto::ApiError;
 use AppError::*;
 use argon2::password_hash::Error as Argon2Error;
@@ -12,11 +13,19 @@ use sqlx::Error as SqlxError;
 use thiserror::Error;
 use tracing::*;
 
-/// Convenient alias used across the project.
+/// プロジェクト全体で使用するResult型。
 pub type AppResult<T> = Result<T, AppError>;
 
-/// Top-level application error.
-/// Each variant maps to an HTTP status code and optional detail.
+/// PostgreSQLのSQLSTATEコード定数。
+pub mod sqlx_error_code {
+    pub const UNIQUE_VIOLATION: &str = "23505";
+    pub const FK_VIOLATION: &str = "23503";
+    pub const NOT_NULL_VIOLATION: &str = "23502";
+    pub const CHECK_VIOLATION: &str = "23514";
+}
+
+/// アプリケーション全体で使用される上位エラー型。
+/// 各バリアントは対応する<HTTP Status Code>とOpt.の<Detail>を持つ。
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("Bad Request")]
@@ -41,7 +50,7 @@ pub enum AppError {
 }
 
 impl AppError {
-    /// Converted to HTTP status code
+    /// AppErrorを<HTTP Status Code>に変換する。
     pub fn status_code(&self) -> StatusCode {
         use AppError::*;
         match self {
@@ -56,7 +65,7 @@ impl AppError {
             InternalServerError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
-    /// optional detail
+    /// AppErrorが持つ<Detail>を返す（無ければ None）。
     pub fn detail(&self) -> Option<&String> {
         match self {
             BadRequest(d)
@@ -73,17 +82,18 @@ impl AppError {
 }
 
 impl IntoResponse for AppError {
+    /// AppErrorをaxumの<HTTP Response>に変換する。
     fn into_response(self) -> Response {
         let status = self.status_code();
 
-        // Always log errors for consistency
+        // ログ出力（500系はerror、それ以外はwarn）
         if status.is_server_error() {
             error!(?self, "internal server error");
         } else {
             warn!(?self, "client error");
         }
 
-        // 5xx does not return detail
+        // Statusに応じてResponse Bodyを構築（500系には<Detail>を含めない）
         let body = if status.is_server_error() {
             ApiError {
                 status: status.as_u16(),
@@ -109,17 +119,45 @@ impl IntoResponse for AppError {
     }
 }
 
-// Conversions
+/// sqlx のエラーをAppErrorに変換する。
 impl From<SqlxError> for AppError {
     fn from(e: SqlxError) -> Self {
+        // エラーを文字列化する。
+        let e_str = e.to_string();
+
         match e {
-            SqlxError::RowNotFound => AppError::NotFound(Some("Resource not found".to_string())),
+            SqlxError::RowNotFound => AppError::NotFound(Some("Resource not found".into())),
+            SqlxError::PoolTimedOut => AppError::RequestTimeout(Some("Database timeout".into())),
+            SqlxError::Database(db_err) => match db_err.code().unwrap_or_default().as_ref() {
+                sqlx_error_code::UNIQUE_VIOLATION => {
+                    AppError::Conflict(Some("Duplicate key".into()))
+                }
+                sqlx_error_code::FK_VIOLATION => {
+                    AppError::Conflict(Some("Foreign-key violation".into()))
+                }
+                sqlx_error_code::NOT_NULL_VIOLATION => {
+                    AppError::BadRequest(Some("Null value in column".into()))
+                }
+                sqlx_error_code::CHECK_VIOLATION => {
+                    AppError::UnprocessableContent(Some("Check violation".into()))
+                }
+                code => AppError::InternalServerError(Some(format!(
+                    "Database error ({code}): {}",
+                    db_err.message()
+                ))),
+            },
+            // 文字列に"timeout"が含まれていれば408エラー。
+            _ if e_str.contains("timeout") => {
+                AppError::RequestTimeout(Some("Database timeout".into()))
+            }
+
+            // その他不明なエラー。
             other => AppError::InternalServerError(Some(format!("DB error: {other}"))),
         }
     }
 }
 
-/// Password hashing / verification errors.
+/// パスワードのハッシュ化・検証に関連するエラー。
 #[derive(Debug, Error)]
 pub enum HashingError {
     #[error("Password mismatch")]
@@ -128,7 +166,7 @@ pub enum HashingError {
     Argon2(#[from] Argon2Error),
 }
 
-/// Database errors used in domain layer.
+/// ドメイン層で使用されるデータベース関連のエラー。
 #[derive(Debug, Error)]
 pub enum DatabaseError {
     #[error("Row not found")]
