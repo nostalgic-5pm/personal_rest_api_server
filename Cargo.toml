@@ -29,6 +29,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["fmt", "json", "time"] }
 unicode-general-category = "1.0.0"
 unicode-normalization = "0.1.24"
+unicode-segmentation = "1.12.0"
 urlencoding = "2.1.3"
 uuid = { version = "1.17.0", features = ["v4"] }
 zxcvbn = "3.1.0"
