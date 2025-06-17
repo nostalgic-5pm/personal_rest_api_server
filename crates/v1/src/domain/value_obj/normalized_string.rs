@@ -89,7 +89,7 @@ impl NormalizedString {
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::value_obj::normalized_str::NormalizedString;
+    use crate::domain::value_obj::normalized_string::NormalizedString;
 
     #[test]
     fn normalizes_nfkc_differently_composed_characters() {
