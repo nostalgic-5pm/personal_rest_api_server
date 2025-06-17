@@ -6,3 +6,5 @@ Cargo.lock
 # config
 .env
 config/development.toml
+
+scripts/all_code.txt

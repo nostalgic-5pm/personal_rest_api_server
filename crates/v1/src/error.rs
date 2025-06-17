@@ -98,10 +98,7 @@ impl IntoResponse for AppError {
         } else {
             ApiError {
                 status: status.as_u16(),
-                message: status
-                    .canonical_reason()
-                    .unwrap_or("Error")
-                    .to_string(),
+                message: status.canonical_reason().unwrap_or("Error").to_string(),
                 detail: self.detail().cloned(),
                 instance: None,
                 timestamp: Utc::now().timestamp(),
@@ -116,12 +113,8 @@ impl IntoResponse for AppError {
 impl From<SqlxError> for AppError {
     fn from(e: SqlxError) -> Self {
         match e {
-            SqlxError::RowNotFound => {
-                AppError::NotFound(Some("Resource not found".to_string()))
-            }
-            other => AppError::InternalServerError(Some(format!(
-                "DB error: {other}"
-            ))),
+            SqlxError::RowNotFound => AppError::NotFound(Some("Resource not found".to_string())),
+            other => AppError::InternalServerError(Some(format!("DB error: {other}"))),
         }
     }
 }

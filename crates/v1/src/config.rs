@@ -3,7 +3,7 @@ use config::{Config, Environment, File};
 use dotenvy::dotenv;
 use serde::Deserialize;
 use std::path::PathBuf;
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
@@ -48,21 +48,12 @@ impl AppConfig {
             warn!(".env file not found or failed to load");
         }
 
-        // Create an absolute path to workspace root/config
-        let root_config = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent()) // workspace root
-            .expect("workspace root")
-            .join("config");
+        let config_dir = Self::workspace_root()?;
+        info!("Loading configuration from {:?}", config_dir);
 
         let builder = Config::builder()
-            .add_source(
-                File::from(root_config.join("defaults.toml")).required(true),
-            )
-            .add_source(
-                File::from(root_config.join("development.toml"))
-                    .required(false),
-            )
+            .add_source(File::from(config_dir.join("defaults.toml")).required(true))
+            .add_source(File::from(config_dir.join("development.toml")).required(false))
             .add_source(Environment::with_prefix("APP").separator("__"))
             .add_source(Environment::with_prefix("POSTGRES").separator("__"))
             .add_source(Environment::with_prefix("LOGGING").separator("__"));
@@ -95,19 +86,35 @@ impl AppConfig {
             self.postgres.name
         )
     }
+
+    fn workspace_root() -> AppResult<PathBuf> {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest_dir
+            .parent() // crates
+            .and_then(|p| p.parent()) // workspace root
+            .ok_or_else(|| {
+                AppError::InternalServerError(Some(
+                    "Failed to locate workspace root from CARGO_MANIFEST_DIR".into(),
+                ))
+            })?;
+        let config_dir = root.join("config");
+        if !config_dir.is_dir() {
+            return Err(AppError::InternalServerError(Some(format!(
+                "Expected config directory at {:?}, but not found",
+                config_dir
+            ))));
+        }
+        Ok(config_dir)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::AppConfig;
-
-    /// 環境変数やファイルから読み込んだAppConfigをDebugで表示する。
+    /// AppConfig が正常に読み込めるか確認し、内容を表示
     #[test]
     fn print_app_config() {
-        // 設定読み込み
         let cfg = AppConfig::new().expect("Failed to load AppConfig");
-
-        // Debug 表現で出力（pretty print）
         println!("{:#?}", cfg);
     }
 }
