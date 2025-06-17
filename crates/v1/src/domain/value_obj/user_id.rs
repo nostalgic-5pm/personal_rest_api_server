@@ -20,3 +20,20 @@ impl UserId {
         self.0
     }
 }
+
+#[cfg(test)]
+mod user_id_test {
+    use super::*;
+    #[test]
+    fn user_id_ok() {
+        assert_eq!(UserId::new(1).unwrap().as_i64(), 1);
+    }
+    #[test]
+    fn user_id_0_err() {
+        assert!(UserId::new(0).is_err())
+    }
+    #[test]
+    fn user_id_str_minus() {
+        assert!(UserId::new(-10).is_err())
+    }
+}
